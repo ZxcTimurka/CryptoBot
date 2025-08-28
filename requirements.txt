@@ -1,0 +1,13 @@
+certifi==2025.8.3
+charset-normalizer==3.4.3
+idna==3.10
+pyaes==1.6.1
+pyasn1==0.6.1
+pybit==5.11.0
+pycryptodome==3.23.0
+python-dotenv==1.1.1
+requests==2.32.5
+rsa==4.9.1
+Telethon==1.40.0
+urllib3==2.5.0
+websocket-client==1.8.0
