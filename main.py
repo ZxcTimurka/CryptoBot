@@ -24,19 +24,16 @@ SESSION_NAME = os.getenv("SESSION_NAME")
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
+# IS_TESTNET = os.getenv("IS_TESTNET")
 
-# Доп.настройки: список спотовых инструментов (через .env в виде "BTCUSDT,ETHUSDT,XRPUSDT")
 SPOT_SYMBOLS = [
     s.strip().upper()
     for s in os.getenv("SPOT_SYMBOLS", "BTCUSDT,ETHUSDT,XRPUSDT,ADAUSDT").split(",")
     if s.strip()
 ]
 
-# TRADE_AMOUNT_USD фиксированно на каждую сделку
 TRADE_AMOUNT_USD = Decimal(os.getenv("TRADE_AMOUNT_USD", "1000"))
 
-# Настройка точностей: можешь задать в .env в формате "BNBUSDT:6,BTCUSDT:6,ETHUSDT:6"
-# По умолчанию — DEFAULT_BASE_PRECISION (если инструмент не указан в карте)
 DEFAULT_BASE_PRECISION = int(os.getenv("DEFAULT_BASE_PRECISION", "3"))
 _spot_decimals_env = os.getenv("SPOT_DECIMALS", "")
 SPOT_DECIMALS = {}
@@ -86,7 +83,6 @@ def save_positions(positions):
 
 
 def write_trade_row(row):
-    # timezone-aware timestamp must be passed in the row already
     with open(TRADES_CSV, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(row)
@@ -100,10 +96,6 @@ def to_decimal(x):
 
 
 def round_down_decimal(value: Decimal, precision: int) -> Decimal:
-    """
-    Округляет Decimal value вниз до precision знаков после запятой.
-    precision = 0 -> целое число.
-    """
     try:
         value = to_decimal(value)
         if precision <= 0:
@@ -113,11 +105,9 @@ def round_down_decimal(value: Decimal, precision: int) -> Decimal:
             quant = Decimal(quant_str)
         return value.quantize(quant, rounding=ROUND_DOWN)
     except Exception:
-        # на случай ошибок — возвращаем исходное, но не None
-        return value
+        return to_decimal(value)
 
 
-# FIFO matching: добавляем позиции при BUY, закрываем при SELL
 def update_positions_and_compute_pnl(symbol, side, price, qty, fee=0):
     positions = load_positions()
     pos = positions.get(symbol, {"longs": [], "shorts": [], "realized_pnl_total": "0"})
@@ -196,7 +186,7 @@ try:
         api_key=BYBIT_API_KEY,
         api_secret=BYBIT_API_SECRET,
     )
-    logger.info("Клиент Bybit (pybit HTTP) инициализирован для Testnet.")
+    logger.info("Клиент Bybit инициализирован.")
 except Exception as e:
     logger.error(f"Ошибка при инициализации клиентов: {e}")
     raise SystemExit(1)
@@ -233,7 +223,6 @@ def parse_signal(message):
     return None
 
 
-# --- Вспомогательная: извлечь fills из response ---
 def extract_fills_from_response(response):
     fills = []
     if not response:
@@ -251,11 +240,13 @@ def extract_fills_from_response(response):
                 or "execprice" in keys
                 or "avgprice" in keys
                 or "fillednotional" in keys
+                or "fillednotional" in keys
             ) and (
                 "qty" in keys
                 or "execqty" in keys
                 or "filledqty" in keys
                 or "orderqty" in keys
+                or "fillednotional" in keys
             ):
                 found.append(obj)
             else:
@@ -302,8 +293,11 @@ def extract_fills_from_response(response):
                         fee = Decimal(str(v))
                     except Exception:
                         pass
-                if "order" in kl and order_id is None:
-                    order_id = str(v)
+                if ("order" in kl or "id" in kl) and order_id is None:
+                    try:
+                        order_id = str(v)
+                    except Exception:
+                        pass
             if price is not None and qty is not None:
                 fills.append(
                     {"price": price, "qty": qty, "fee": fee, "order_id": order_id}
@@ -311,14 +305,106 @@ def extract_fills_from_response(response):
     return fills
 
 
-# --- New helper: получить баланс USDT (обновлённый, см. предыдущие сообщения) ---
+# --- рекурсивный поиск order_id и exec_price в ответе ---
+def recursive_find_key(obj, key_candidates):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if any(kk.lower() in k.lower() for kk in key_candidates):
+                return v
+        for v in obj.values():
+            res = recursive_find_key(v, key_candidates)
+            if res is not None:
+                return res
+    elif isinstance(obj, list):
+        for el in obj:
+            res = recursive_find_key(el, key_candidates)
+            if res is not None:
+                return res
+    return None
+
+
+def get_order_id_from_response(response):
+    if not response:
+        return ""
+    candidates = [
+        "orderId",
+        "order_id",
+        "orderid",
+        "orderID",
+        "clientOrderId",
+        "clientOrderId",
+    ]
+    res = recursive_find_key(response, candidates)
+    if res is None:
+        return ""
+    if isinstance(res, (str, int)):
+        return str(res)
+    if isinstance(res, dict):
+        for k in ("orderId", "order_id", "id"):
+            if k in res:
+                return str(res[k])
+        return json.dumps(res, ensure_ascii=False)
+    if isinstance(res, list):
+        try:
+            return str(res[0])
+        except Exception:
+            return ""
+    return ""
+
+
+def get_exec_price_from_response_or_market(response, symbol):
+    price_candidates = [
+        "avgPrice",
+        "avgprice",
+        "price",
+        "execPrice",
+        "execprice",
+        "filledNotional",
+        "tradePrice",
+    ]
+    for cand in price_candidates:
+        res = recursive_find_key(response, [cand])
+        if res is not None:
+            try:
+                return to_decimal(res)
+            except Exception:
+                pass
+    fills = extract_fills_from_response(response)
+    if fills:
+        total_notional = Decimal("0")
+        total_qty = Decimal("0")
+        for f in fills:
+            p = to_decimal(f.get("price", "0"))
+            q = to_decimal(f.get("qty", "0"))
+            total_notional += p * q
+            total_qty += q
+        if total_qty > 0:
+            return (total_notional / total_qty).quantize(Decimal("0.00000001"))
+
+    try:
+        ticker = session.get_tickers(category="spot", symbol=symbol)
+        tlist = ticker.get("result", {}).get("list", [])
+        if tlist:
+            top = tlist[0]
+            for key in ("lastPrice", "last_price", "price", "ask1Price", "bid1Price"):
+                val = top.get(key)
+                if val is not None:
+                    try:
+                        return to_decimal(val)
+                    except Exception:
+                        continue
+    except Exception as e:
+        logger.debug(f"Не удалось получить тикер для {symbol}: {e}")
+
+    return Decimal("0")
+
+
+# --- получить баланс USDT ---
 def get_usdt_balance():
     try:
         resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
         logger.debug("get_wallet_balance(UNIFIED) response: %s", resp)
-
         result = resp.get("result", resp)
-
         if isinstance(result, dict):
             tavail = result.get("totalAvailableBalance")
             if tavail is not None:
@@ -326,22 +412,18 @@ def get_usdt_balance():
                     return to_decimal(tavail)
                 except Exception:
                     pass
-
             lst = result.get("list")
             if isinstance(lst, list) and len(lst) > 0:
                 first = lst[0]
                 if isinstance(first, dict):
-                    tav = (
-                        first.get("totalAvailableBalance")
-                        or first.get("totalWalletBalance")
-                        or first.get("totalMarginBalance")
+                    tav = first.get("totalAvailableBalance") or first.get(
+                        "totalWalletBalance"
                     )
                     if tav is not None:
                         try:
                             return to_decimal(tav)
                         except Exception:
                             pass
-
                     coins = first.get("coin")
                     if isinstance(coins, list):
                         for sub in coins:
@@ -354,9 +436,7 @@ def get_usdt_balance():
                                     "walletBalance",
                                     "usdValue",
                                     "equity",
-                                    "availableToWithdraw",
-                                    "balance",
-                                    "totalBalance",
+                                    "available",
                                 ):
                                     if k in sub:
                                         try:
@@ -381,7 +461,6 @@ def get_usdt_balance():
                         "totalWalletBalance",
                         "balance",
                         "totalBalance",
-                        "equity",
                     ):
                         if k in obj:
                             try:
@@ -402,18 +481,13 @@ def get_usdt_balance():
         rec = recursive_search_for_usdt(resp)
         if rec is not None:
             return rec
-
-        logger.debug(
-            "get_usdt_balance: не удалось найти явный USDT в result structure. Full resp logged above."
-        )
     except Exception as e:
         logger.warning(f"Не удалось получить баланс UNIFIED: {e}")
-
     logger.info("Баланс USDT не найден — вернул 0.")
     return Decimal("0")
 
 
-# --- NEW helpers: qty precision / local base qty ---
+# --- qty precision / local base qty ---
 def get_local_long_qty(symbol):
     positions = load_positions()
     pos = positions.get(symbol, {})
@@ -438,10 +512,9 @@ def get_base_balance_from_api(symbol):
                 for k in (
                     "availableBalance",
                     "available",
-                    "totalAvailableBalance",
+                    "walletBalance",
                     "balance",
                     "totalBalance",
-                    "walletBalance",
                 ):
                     if k in item:
                         return to_decimal(item.get(k))
@@ -451,14 +524,9 @@ def get_base_balance_from_api(symbol):
 
 
 def get_precision_for_symbol(symbol: str) -> int:
-    """
-    Возвращает количество знаков после запятой для базовой валюты символа, если указано в SPOT_DECIMALS.
-    Иначе — DEFAULT_BASE_PRECISION.
-    """
     return SPOT_DECIMALS.get(symbol.upper(), DEFAULT_BASE_PRECISION)
 
 
-# --- NEW: close_spot_position with precision-aware rounding ---
 def close_spot_position(symbol):
     try:
         base_qty = get_local_long_qty(symbol)
@@ -507,41 +575,26 @@ def close_spot_position(symbol):
 
         logger.debug(f"Ответ Bybit на close (raw): {response}")
 
+        order_id = get_order_id_from_response(response)
         fills = extract_fills_from_response(response)
-        if not fills:
-            price_decimal = None
-            try:
-                ticker = session.get_tickers(category="spot", symbol=symbol)
-                tlist = ticker.get("result", {}).get("list", [])
-                if tlist:
-                    ask = (
-                        tlist[0].get("bid1Price")
-                        or tlist[0].get("lastPrice")
-                        or tlist[0].get("price")
-                    )
-                    if ask:
-                        price_decimal = Decimal(str(ask))
-            except Exception:
-                price_decimal = None
 
+        if not fills:
+            exec_price = get_exec_price_from_response_or_market(response, symbol)
             fills = [
                 {
-                    "price": price_decimal
-                    if price_decimal is not None
-                    else Decimal("0"),
+                    "price": exec_price,
                     "qty": base_qty,
                     "fee": Decimal("0"),
-                    "order_id": str(
-                        response.get("orderId") if isinstance(response, dict) else ""
-                    ),
+                    "order_id": order_id,
                 }
             ]
+            logger.debug("Fallback fill created for close_spot_position.")
 
         for f in fills:
             price = f["price"]
             qty = f["qty"]
             fee = f.get("fee", Decimal("0"))
-            order_id = f.get("order_id", "")
+            order_id = f.get("order_id") or order_id or ""
             realized = update_positions_and_compute_pnl(symbol, "Sell", price, qty, fee)
             write_trade_row(
                 [
@@ -583,7 +636,7 @@ def close_spot_position(symbol):
 def place_order_on_bybit(signal_data):
     try:
         symbol = signal_data["symbol"].upper()
-        side = signal_data["side"].capitalize()  # Buy / Sell
+        side = signal_data["side"].capitalize()
 
         if symbol not in SPOT_SYMBOLS:
             logger.warning(
@@ -622,34 +675,9 @@ def place_order_on_bybit(signal_data):
             else:
                 amount_usdt = desired
 
-            raw_price = signal_data.get("price")
-            price_decimal = None
-            if raw_price:
-                try:
-                    price_decimal = Decimal(raw_price.replace(",", "."))
-                except Exception:
-                    price_decimal = None
-
-            if price_decimal is None:
-                try:
-                    ticker = session.get_tickers(category="spot", symbol=symbol)
-                    tlist = ticker.get("result", {}).get("list", [])
-                    if tlist:
-                        ask = (
-                            tlist[0].get("ask1Price")
-                            or tlist[0].get("lastPrice")
-                            or tlist[0].get("price")
-                        )
-                        if ask:
-                            price_decimal = Decimal(str(ask))
-                    logger.info(f"Получили цену из тикера: {price_decimal}")
-                except Exception as e:
-                    logger.warning(f"Не удалось получить тикер для {symbol}: {e}")
-
             logger.info(
                 f"Попытка Market Buy (spot) {symbol} за {amount_usdt} USDT (marketUnit=quoteCoin)"
             )
-
             response = session.place_order(
                 category="spot",
                 symbol=symbol,
@@ -658,63 +686,53 @@ def place_order_on_bybit(signal_data):
                 qty=str(amount_usdt),
                 marketUnit="quoteCoin",
             )
-
             logger.debug(f"Ответ Bybit (raw): {response}")
 
+            order_id = get_order_id_from_response(response)
             fills = extract_fills_from_response(response)
 
             if not fills:
-                fallback_price_val = price_decimal
-                if fallback_price_val is not None and fallback_price_val != 0:
-                    # qty(base) = amount_usdt / price
-                    try:
-                        raw_base_qty = to_decimal(amount_usdt) / fallback_price_val
-                    except Exception:
-                        raw_base_qty = Decimal("0")
-                    precision = get_precision_for_symbol(symbol)
-                    base_qty = round_down_decimal(raw_base_qty, precision)
-                    fills = [
-                        {
-                            "price": fallback_price_val,
-                            "qty": base_qty,
-                            "fee": Decimal("0"),
-                            "order_id": str(
-                                response.get("orderId")
-                                if isinstance(response, dict)
-                                else ""
-                            ),
-                        }
-                    ]
-                else:
+                exec_price = get_exec_price_from_response_or_market(response, symbol)
+                if exec_price == 0:
                     logger.warning(
-                        "Не удалось извлечь fills и нет цены для fallback — логирую событие."
+                        "Не удалось определить цену исполнения (market) — логирую без fills."
                     )
                     write_trade_row(
                         [
                             datetime.now(timezone.utc).isoformat(),
                             symbol,
                             "Buy",
-                            str(
-                                response.get("orderId")
-                                if isinstance(response, dict)
-                                else ""
-                            ),
+                            order_id or "",
                             "",
                             "",
                             "",
                             "",
                             "",
-                            "no_fills_found",
+                            "no_fills_no_price",
                         ]
                     )
                     return
+                try:
+                    raw_base_qty = to_decimal(amount_usdt) / exec_price
+                except Exception:
+                    raw_base_qty = Decimal("0")
+                precision = get_precision_for_symbol(symbol)
+                base_qty = round_down_decimal(raw_base_qty, precision)
+                fills = [
+                    {
+                        "price": exec_price,
+                        "qty": base_qty,
+                        "fee": Decimal("0"),
+                        "order_id": order_id or "",
+                    }
+                ]
+                logger.debug("Fallback fill created for Buy.")
 
             for f in fills:
                 price = f["price"]
                 qty = f["qty"]
                 fee = f.get("fee", Decimal("0"))
-                order_id = f.get("order_id", "")
-
+                order_id = f.get("order_id") or order_id or ""
                 realized = update_positions_and_compute_pnl(
                     symbol, "Buy", price, qty, fee
                 )
@@ -732,7 +750,6 @@ def place_order_on_bybit(signal_data):
                         "ok",
                     ]
                 )
-
                 logger.info(
                     f"Exec logged: symbol={symbol} side=Buy price={price} qty={qty} realized_pnl={realized}"
                 )
@@ -745,7 +762,7 @@ def place_order_on_bybit(signal_data):
             return
 
     except Exception as e:
-        logger.error(f"Ошибка при размещении ордера на Bybit: {e}")
+        logger.exception(f"Ошибка при размещении ордера на Bybit: {e}")
         write_trade_row(
             [
                 datetime.now(timezone.utc).isoformat(),
@@ -774,9 +791,7 @@ async def handler(event):
     message_text = event.message.text or ""
     logger.info("Получено новое сообщение из канала.")
     signal = parse_signal(message_text)
-
     if signal:
-        # place_order_on_bybit синхронная — можно вызывать прямо
         place_order_on_bybit(signal)
     else:
         logger.warning(
